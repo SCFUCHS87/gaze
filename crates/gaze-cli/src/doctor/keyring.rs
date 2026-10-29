@@ -250,14 +250,8 @@ pub(super) fn keyring_record_state(
     if !running_as_root() {
         return RecordState::Unchecked;
     }
-    let Some(uid) = user_uid(username) else {
+    if user_uid(username).is_none() {
         return RecordState::Unchecked;
-    };
-    if !Path::new(backend.store_dir())
-        .join(format!("{uid}.keyring"))
-        .exists()
-    {
-        return RecordState::Missing;
     }
     match gaze_security::keyring::record_pcrs_current(backend, username) {
         Ok(Some(pcrs)) if !pcrs.is_empty() => {
@@ -269,11 +263,12 @@ pub(super) fn keyring_record_state(
     }
 }
 
-/// How to replace a record PAM refuses. `flag` selects the backend.
-fn invalid_record_fix(username: &str, flag: &str) -> String {
+/// How to replace a record PAM refuses.
+fn invalid_record_fix(username: &str, backend: gaze_security::keyring::Backend) -> String {
     format!(
-        "Enroll again with `sudo gaze keyring{flag} --user {username} --pcrs <PCRs or none>`; if \
-         the error names the directory, make it root-owned with mode 0700 first."
+        "Enroll again with `sudo gaze keyring{} --user {username} --pcrs <PCRs or none>`; if \
+         the error names the directory, make it root-owned with mode 0700 first.",
+        backend.cli_flag()
     )
 }
 
@@ -437,7 +432,7 @@ pub(super) fn report_keyring_record(report: &mut Report, username: &str, state: 
         RecordState::Invalid(err) => report.warning(
             "Keyring",
             format!("the keyring credential enrolled for {username} cannot be used: {err}"),
-            invalid_record_fix(username, ""),
+            invalid_record_fix(username, gaze_security::keyring::Backend::Gnome),
         ),
         RecordState::Unchecked => report.warning(
             "Keyring",
@@ -550,7 +545,7 @@ pub(super) fn check_kwallet(report: &mut Report, username: &str, config: Option<
         RecordState::Invalid(err) => report.warning(
             "KWallet",
             format!("the KWallet credential enrolled for {username} cannot be used: {err}"),
-            invalid_record_fix(username, " --kwallet"),
+            invalid_record_fix(username, gaze_security::keyring::Backend::KWallet),
         ),
         RecordState::Unchecked => report.warning(
             "KWallet",
@@ -638,7 +633,10 @@ mod tests {
             fix.contains("sudo gaze keyring --user lambros --pcrs"),
             "{fix}"
         );
-        assert!(invalid_record_fix("lambros", " --kwallet").contains("keyring --kwallet --user"));
+        assert!(
+            invalid_record_fix("lambros", gaze_security::keyring::Backend::KWallet)
+                .contains("keyring --kwallet --user")
+        );
 
         let (level, message, fix) = reported(RecordState::Unchecked);
         assert_eq!(

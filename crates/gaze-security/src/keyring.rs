@@ -38,6 +38,13 @@ impl Backend {
             Self::KWallet => "KWallet",
         }
     }
+    /// The `gaze keyring` flag that selects this backend, with its leading space.
+    pub fn cli_flag(self) -> &'static str {
+        match self {
+            Self::Gnome => "",
+            Self::KWallet => " --kwallet",
+        }
+    }
     fn account(self, username: &str) -> anyhow::Result<Account> {
         Ok(self.bind(Account::lookup(username)?))
     }
@@ -477,12 +484,9 @@ fn reenroll_hint(backend: Backend, username: &str, err: anyhow::Error) -> anyhow
     if err.downcast_ref::<crate::tpm::PolicyFailed>().is_none() {
         return err;
     }
-    let flag = match backend {
-        Backend::Gnome => "",
-        Backend::KWallet => " --kwallet",
-    };
     err.context(format!(
-        "run `sudo gaze keyring{flag} --user {username}` to enroll again"
+        "run `sudo gaze keyring{} --user {username}` to enroll again",
+        backend.cli_flag()
     ))
 }
 
