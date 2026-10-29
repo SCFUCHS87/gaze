@@ -60,6 +60,7 @@ Matching accuracy (false accept rate at a given threshold) is a model property, 
 
 - Do not report that face recognition is weaker than a password. That is a documented trade-off and the password fallback stays in every shipped PAM stack.
 - Do not report findings that need root, the ability to write `/etc/gaze`, `/var/lib/gaze`, or `/etc/pam.d`, or to replace the installed binaries, unless the result crosses the TPM boundary.
+- Do not report that a probe on a discrete TPM's bus can read an unsealed key. TPM sessions are unsalted, so physical bus attacks are out of scope.
 - Do not report vulnerabilities in upstream ONNX Runtime, OpenCV, GStreamer, GTK, or the InsightFace models themselves; report how Gaze uses them instead.
 - `pam_gaze_grosshack.so` prints a deprecation notice to `/dev/tty` by design.
 - The SSH heuristic reading other processes' `/proc` entries is intentional (see `packaging/config/gazed.service`).

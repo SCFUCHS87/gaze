@@ -8,8 +8,8 @@ use anyhow::{Context as _, anyhow, ensure};
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
-use tss_esapi::attributes::{ObjectAttributesBuilder, SessionAttributesBuilder};
-use tss_esapi::constants::{SessionType, Tss2ResponseCodeKind};
+use tss_esapi::attributes::ObjectAttributesBuilder;
+use tss_esapi::constants::{CapabilityType, SessionType, Tss2ResponseCodeKind};
 use tss_esapi::handles::SessionHandle;
 use tss_esapi::interface_types::algorithm::{HashingAlgorithm, PublicAlgorithm};
 use tss_esapi::interface_types::ecc::EccCurve;
@@ -17,9 +17,10 @@ use tss_esapi::interface_types::key_bits::AesKeyBits;
 use tss_esapi::interface_types::resource_handles::Hierarchy;
 use tss_esapi::interface_types::session_handles::PolicySession;
 use tss_esapi::structures::{
-    Digest, EccPoint, EccScheme, KeyDerivationFunctionScheme, KeyedHashScheme,
-    PcrSelectionListBuilder, PcrSlot, Private, Public, PublicBuilder, PublicEccParametersBuilder,
-    PublicKeyedHashParameters, SensitiveData, SymmetricDefinition, SymmetricDefinitionObject,
+    CapabilityData, Digest, EccPoint, EccScheme, KeyDerivationFunctionScheme, KeyedHashScheme,
+    PcrSelectionList, PcrSelectionListBuilder, PcrSlot, Private, Public, PublicBuilder,
+    PublicEccParametersBuilder, PublicKeyedHashParameters, SensitiveData, SymmetricDefinition,
+    SymmetricDefinitionObject,
 };
 use tss_esapi::tcti_ldr::DeviceConfig;
 use tss_esapi::traits::{Marshall, UnMarshall};
@@ -94,6 +95,23 @@ impl fmt::Display for Pcrs {
         f.write_str(&list.join(","))
     }
 }
+
+/// The TPM refused an unseal because the sealed object's PCR policy no longer holds.
+/// The PCRs come from the unauthenticated record header, so the message allows for both causes.
+#[derive(Debug)]
+pub struct PolicyFailed(pub Pcrs);
+
+impl fmt::Display for PolicyFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "PCRs {} changed since enrollment, or the record was altered",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for PolicyFailed {}
 
 /// A sealed key never leaves this crate as a bare array: the caller's copy wipes on drop.
 pub type SealedKey = Zeroizing<[u8; KEY_LEN]>;
@@ -205,19 +223,14 @@ fn pcr_policy_session(
         )
         .context("TPM StartAuthSession failed")?
         .context("TPM returned no policy session")?;
-    let (attributes, mask) = SessionAttributesBuilder::new()
-        .with_decrypt(true)
-        .with_encrypt(true)
-        .build();
     let policy = PolicySession::try_from(session)?;
     let result = (|| {
-        context.tr_sess_set_attributes(session, attributes, mask)?;
         let selection = PcrSelectionListBuilder::new()
             .with_selection(HashingAlgorithm::Sha256, &pcrs.slots()?)
             .build()?;
         context
             .policy_pcr(policy, Digest::default(), selection)
-            .context("TPM PolicyPCR failed; is the SHA-256 PCR bank active?")
+            .context("TPM PolicyPCR failed")
     })();
     if let Err(error) = result {
         let _ = context.flush_context(SessionHandle::from(policy).into());
@@ -226,7 +239,37 @@ fn pcr_policy_session(
     Ok(policy)
 }
 
+/// PCRs in `pcrs` that the TPM's SHA-256 bank does not hold.
+fn missing_from_sha256_bank(pcrs: Pcrs, allocated: &PcrSelectionList) -> anyhow::Result<Pcrs> {
+    let held = allocated
+        .get_selections()
+        .iter()
+        .filter(|selection| selection.hashing_algorithm() == HashingAlgorithm::Sha256)
+        .flat_map(|selection| selection.selected())
+        .fold(0, |bits, slot| bits | u32::from(slot));
+    Pcrs::from_bits(pcrs.bits() & !held)
+}
+
+// PolicyPCR silently drops PCRs from banks the TPM has not allocated, so without this check
+// a SHA-1-only TPM would seal to an empty selection that matches any boot.
+fn ensure_sha256_bank(context: &mut Context, pcrs: Pcrs) -> anyhow::Result<()> {
+    let (data, _) = context
+        .get_capability(CapabilityType::AssignedPcr, 0, 1)
+        .context("TPM GetCapability(PCRS) failed")?;
+    let CapabilityData::AssignedPcr(allocated) = data else {
+        anyhow::bail!("TPM returned no PCR allocation");
+    };
+    let missing = missing_from_sha256_bank(pcrs, &allocated)?;
+    ensure!(
+        missing.is_empty(),
+        "the TPM's SHA-256 bank does not hold PCRs {missing}, so binding to them would \
+         protect nothing; enable the SHA-256 PCR bank in firmware"
+    );
+    Ok(())
+}
+
 fn pcr_policy_digest(context: &mut Context, pcrs: Pcrs) -> anyhow::Result<Digest> {
+    ensure_sha256_bank(context, pcrs)?;
     let trial = pcr_policy_session(context, SessionType::Trial, pcrs)?;
     let digest = context.policy_get_digest(trial);
     let _ = context.flush_context(SessionHandle::from(trial).into());
@@ -316,9 +359,7 @@ fn unseal_with_pcr_policy(
             tss_esapi::Error::Tss2Error(rc)
                 if rc.kind() == Some(Tss2ResponseCodeKind::PolicyFail) =>
             {
-                anyhow!(
-                    "boot state changed since enrollment (PCRs {pcrs}); run `gaze keyring` again"
-                )
+                PolicyFailed(pcrs).into()
             }
             other => other.into(),
         })
@@ -428,9 +469,15 @@ mod tests {
     }
 
     // Run against swtpm, e.g. TCTI=swtpm:port=2321 cargo test -p gaze-security -- --ignored
-    fn test_context() -> Context {
-        Context::new(TctiNameConf::from_environment_variable().expect("set TCTI to a test TPM"))
-            .expect("test TPM unreachable")
+    // The guard serializes tests sharing the TPM, since some of them extend PCR 16.
+    fn test_context() -> (std::sync::MutexGuard<'static, ()>, Context) {
+        static TPM: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = TPM.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let context = Context::new(
+            TctiNameConf::from_environment_variable().expect("set TCTI to a test TPM"),
+        )
+        .expect("test TPM unreachable");
+        (guard, context)
     }
 
     fn extend_pcr16(context: &mut Context) {
@@ -449,7 +496,7 @@ mod tests {
     #[test]
     #[ignore = "requires a test TPM (swtpm) named by TCTI"]
     fn pcr_bound_key_unseals_until_the_pcr_changes() {
-        let mut context = test_context();
+        let (_tpm, mut context) = test_context();
         let pcrs: Pcrs = "7,16".parse().unwrap();
         let key = [3u8; KEY_LEN];
         let (public, private) = seal_bound_in(&mut context, &key, pcrs).unwrap();
@@ -464,16 +511,64 @@ mod tests {
 
         extend_pcr16(&mut context);
         let error = unseal_bound_in(&mut context, public, private, pcrs).unwrap_err();
+        assert!(error.downcast_ref::<PolicyFailed>().is_some(), "{error:#}");
+    }
+
+    #[test]
+    fn only_pcrs_the_sha256_bank_holds_can_be_bound() {
+        let bank = |algorithm, pcrs: &str| {
+            let slots = pcrs.parse::<Pcrs>().unwrap().slots().unwrap();
+            PcrSelectionListBuilder::new()
+                .with_selection(algorithm, &slots)
+                .build()
+                .unwrap()
+        };
+        let wanted: Pcrs = "7,16".parse().unwrap();
         assert!(
-            format!("{error:#}").contains("boot state changed"),
-            "{error:#}"
+            missing_from_sha256_bank(wanted, &bank(HashingAlgorithm::Sha256, "0,7,16,23"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            missing_from_sha256_bank(wanted, &bank(HashingAlgorithm::Sha256, "7"))
+                .unwrap()
+                .to_string(),
+            "16"
+        );
+        assert_eq!(
+            missing_from_sha256_bank(wanted, &bank(HashingAlgorithm::Sha1, "0,7,16,23")).unwrap(),
+            wanted,
+            "a SHA-1 bank does not count"
         );
     }
 
     #[test]
     #[ignore = "requires a test TPM (swtpm) named by TCTI"]
+    fn sealing_needs_the_pcrs_in_the_sha256_bank() {
+        let (_tpm, mut context) = test_context();
+        let (data, _) = context
+            .get_capability(CapabilityType::AssignedPcr, 0, 1)
+            .unwrap();
+        let CapabilityData::AssignedPcr(allocated) = data else {
+            panic!("no PCR allocation")
+        };
+        let pcrs: Pcrs = "7".parse().unwrap();
+        let sealed = seal_bound_in(&mut context, &[5u8; KEY_LEN], pcrs);
+        if missing_from_sha256_bank(pcrs, &allocated)
+            .unwrap()
+            .is_empty()
+        {
+            sealed.unwrap();
+        } else {
+            let error = sealed.unwrap_err();
+            assert!(format!("{error:#}").contains("SHA-256 bank"), "{error:#}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a test TPM (swtpm) named by TCTI"]
     fn unbound_keys_keep_unsealing_after_pcr_changes() {
-        let mut context = test_context();
+        let (_tpm, mut context) = test_context();
         let key = [4u8; KEY_LEN];
         let (public, private) = seal_in(&mut context, &key).unwrap();
         extend_pcr16(&mut context);

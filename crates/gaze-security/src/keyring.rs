@@ -428,12 +428,28 @@ pub fn load_for(backend: Backend, username: &str) -> anyhow::Result<Option<Secre
     let Some(blob) = read_record(&record_path(dir, account.uid), 0)? else {
         return Ok(None);
     };
-    let secret = decrypt_with(&blob, &account, crate::tpm::unseal)?;
+    let secret = decrypt_with(&blob, &account, crate::tpm::unseal)
+        .map_err(|err| reenroll_hint(backend, username, err))?;
     ensure!(
         backend.account(username)?.binding == account.binding,
         "account changed during unlock"
     );
     Ok(Some(secret))
+}
+
+/// Names the command that re-enrolls this backend when a PCR policy stopped holding.
+/// Re-enrolling without `--pcrs` keeps the record's binding.
+fn reenroll_hint(backend: Backend, username: &str, err: anyhow::Error) -> anyhow::Error {
+    if err.downcast_ref::<crate::tpm::PolicyFailed>().is_none() {
+        return err;
+    }
+    let flag = match backend {
+        Backend::Gnome => "",
+        Backend::KWallet => " --kwallet",
+    };
+    err.context(format!(
+        "run `sudo gaze keyring{flag} --user {username}` to enroll again"
+    ))
 }
 
 #[cfg(test)]
@@ -729,6 +745,28 @@ mod tests {
             Backend::Gnome.bind(account()).binding,
             account().binding,
             "gnome keeps the compatible binding"
+        );
+    }
+
+    #[test]
+    fn a_failed_pcr_policy_names_the_backends_reenroll_command() {
+        let failed = || anyhow::Error::from(crate::tpm::PolicyFailed("7".parse().unwrap()));
+        let gnome = format!("{:#}", reenroll_hint(Backend::Gnome, "alice", failed()));
+        assert!(
+            gnome.contains("`sudo gaze keyring --user alice`"),
+            "{gnome}"
+        );
+        assert!(gnome.contains("PCRs 7 changed"), "{gnome}");
+        let wallet = format!("{:#}", reenroll_hint(Backend::KWallet, "alice", failed()));
+        assert!(
+            wallet.contains("`sudo gaze keyring --kwallet --user alice`"),
+            "{wallet}"
+        );
+        let other = reenroll_hint(Backend::KWallet, "alice", anyhow::anyhow!("corrupt"));
+        assert_eq!(
+            format!("{other:#}"),
+            "corrupt",
+            "only a policy failure is fixed by enrolling again"
         );
     }
 }

@@ -233,28 +233,48 @@ pub(super) fn success_skip(control: &str) -> Option<usize> {
     }
 }
 
-/// `None` when unchecked, `Some(None)` when nothing is enrolled, else the record's PCR binding.
+pub(super) enum RecordState {
+    /// Not checked: reading the record needs root.
+    Unchecked,
+    Missing,
+    /// Enrolled, with a description of its PCR binding.
+    Enrolled(String),
+    /// Present, but PAM would refuse it for this reason.
+    Invalid(String),
+}
+
 pub(super) fn keyring_record_state(
     username: &str,
     backend: gaze_security::keyring::Backend,
-) -> Option<Option<String>> {
+) -> RecordState {
     if !running_as_root() {
-        return None;
+        return RecordState::Unchecked;
     }
-    let uid = user_uid(username)?;
+    let Some(uid) = user_uid(username) else {
+        return RecordState::Unchecked;
+    };
     if !Path::new(backend.store_dir())
         .join(format!("{uid}.keyring"))
         .exists()
     {
-        return Some(None);
+        return RecordState::Missing;
     }
-    Some(Some(
-        match gaze_security::keyring::record_pcrs(backend, username) {
-            Ok(Some(pcrs)) if !pcrs.is_empty() => format!("bound to PCRs {pcrs}"),
-            Ok(_) => "no PCR binding".to_string(),
-            Err(err) => format!("PCR binding unreadable: {err}"),
-        },
-    ))
+    match gaze_security::keyring::record_pcrs(backend, username) {
+        Ok(Some(pcrs)) if !pcrs.is_empty() => {
+            RecordState::Enrolled(format!("bound to PCRs {pcrs}"))
+        }
+        Ok(Some(_)) => RecordState::Enrolled("no PCR binding".to_string()),
+        Ok(None) => RecordState::Missing,
+        Err(err) => RecordState::Invalid(format!("{err:#}")),
+    }
+}
+
+/// How to replace a record PAM refuses. `flag` selects the backend.
+fn invalid_record_fix(username: &str, flag: &str) -> String {
+    format!(
+        "Enroll again with `sudo gaze keyring{flag} --user {username} --pcrs <PCRs or none>`; if \
+         the error names the directory, make it root-owned with mode 0700 first."
+    )
 }
 
 pub(super) fn check_keyring(report: &mut Report, username: &str, config: Option<&Config>) {
@@ -403,22 +423,23 @@ pub(super) fn report_greeter_keyring_policy(report: &mut Report, policy: ModuleS
     }
 }
 
-pub(super) fn report_keyring_record(
-    report: &mut Report,
-    username: &str,
-    state: Option<Option<String>>,
-) {
+pub(super) fn report_keyring_record(report: &mut Report, username: &str, state: RecordState) {
     match state {
-        Some(Some(binding)) => report.pass(
+        RecordState::Enrolled(binding) => report.pass(
             "Keyring",
             format!("a TPM-protected keyring credential is enrolled for {username} ({binding})"),
         ),
-        Some(None) => report.warning(
+        RecordState::Missing => report.warning(
             "Keyring",
             format!("GNOME Keyring unlock is enabled but {username} has no enrolled credential"),
             format!("Run `sudo gaze keyring --user {username}`."),
         ),
-        None => report.warning(
+        RecordState::Invalid(err) => report.warning(
+            "Keyring",
+            format!("the keyring credential enrolled for {username} cannot be used: {err}"),
+            invalid_record_fix(username, ""),
+        ),
+        RecordState::Unchecked => report.warning(
             "Keyring",
             format!(
                 "the {GDM_FACE_PAM_SERVICE} stack passes the token, but whether {username} has \
@@ -517,16 +538,21 @@ pub(super) fn check_kwallet(report: &mut Report, username: &str, config: Option<
         return;
     }
     match keyring_record_state(username, gaze_security::keyring::Backend::KWallet) {
-        Some(Some(binding)) => report.pass(
+        RecordState::Enrolled(binding) => report.pass(
             "KWallet",
             format!("a TPM-protected KWallet credential is enrolled for {username} ({binding})"),
         ),
-        Some(None) => report.warning(
+        RecordState::Missing => report.warning(
             "KWallet",
             format!("{username} has no enrolled KWallet credential"),
             format!("Run `sudo gaze keyring --kwallet --user {username}`."),
         ),
-        None => report.warning(
+        RecordState::Invalid(err) => report.warning(
+            "KWallet",
+            format!("the KWallet credential enrolled for {username} cannot be used: {err}"),
+            invalid_record_fix(username, " --kwallet"),
+        ),
+        RecordState::Unchecked => report.warning(
             "KWallet",
             "KWallet enrollment could not be checked without root",
             "Run `sudo gaze doctor` to check the credential record.",
@@ -589,17 +615,32 @@ mod tests {
             (check.level, check.message, check.fix.unwrap_or_default())
         };
 
-        let (level, message, _) = reported(Some(Some("bound to PCRs 7".to_string())));
+        let (level, message, _) = reported(RecordState::Enrolled("bound to PCRs 7".to_string()));
         assert_eq!(level, Level::Pass);
         assert!(
             message.contains("bound to PCRs 7"),
             "show the binding: {message}"
         );
 
-        let (level, _, _) = reported(Some(None));
+        let (level, _, _) = reported(RecordState::Missing);
         assert_eq!(level, Level::Warning);
 
-        let (level, message, fix) = reported(None);
+        let (level, message, fix) = reported(RecordState::Invalid(
+            "invalid credential record".to_string(),
+        ));
+        assert_eq!(
+            level,
+            Level::Warning,
+            "PAM refuses this record, so it cannot pass"
+        );
+        assert!(message.contains("invalid credential record"), "{message}");
+        assert!(
+            fix.contains("sudo gaze keyring --user lambros --pcrs"),
+            "{fix}"
+        );
+        assert!(invalid_record_fix("lambros", " --kwallet").contains("keyring --kwallet --user"));
+
+        let (level, message, fix) = reported(RecordState::Unchecked);
         assert_eq!(
             level,
             Level::Warning,

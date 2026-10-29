@@ -320,9 +320,10 @@ enum Commands {
         forget: bool,
         #[arg(short, long, help = "Act on this user instead of the current one")]
         user: Option<String>,
-        /// Bind the credential to these SHA-256 PCRs, e.g. `7` or `7,14` (default: none)
-        #[arg(long, default_value = "none", conflicts_with = "forget")]
-        pcrs: gaze_security::keyring::Pcrs,
+        /// Bind the credential to these SHA-256 PCRs, e.g. `7`, `7,14` or `none`
+        /// (default: keep the existing record's binding, else none)
+        #[arg(long, conflicts_with = "forget")]
+        pcrs: Option<gaze_security::keyring::Pcrs>,
     },
     /// Check the Gaze installation for configuration and runtime issues
     Doctor {
@@ -1010,15 +1011,25 @@ mod tests {
     }
 
     #[test]
-    fn keyring_pcrs_parse_default_to_none_and_reject_bad_input() {
+    fn keyring_pcrs_are_unset_by_default_and_reject_bad_input() {
         let pcrs = |args: &[&str]| match Cli::try_parse_from(args).map(|cli| cli.command) {
             Ok(Commands::Keyring { pcrs, .. }) => Ok(pcrs),
             Ok(_) => panic!("not the keyring command"),
             Err(err) => Err(err),
         };
-        assert!(pcrs(&["gaze", "keyring"]).unwrap().is_empty());
+        assert!(
+            pcrs(&["gaze", "keyring"]).unwrap().is_none(),
+            "unset, so enrolling again keeps the existing binding"
+        );
+        assert!(
+            pcrs(&["gaze", "keyring", "--pcrs", "none"])
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             pcrs(&["gaze", "keyring", "--pcrs", "7,14"])
+                .unwrap()
                 .unwrap()
                 .to_string(),
             "7,14"

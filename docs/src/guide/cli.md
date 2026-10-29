@@ -213,12 +213,14 @@ sudo gaze keyring --user alice  # act on another account
 gaze keyring --pcrs 7           # also bind the credential to the Secure Boot state
 ```
 
-`--pcrs` takes a comma-separated list of SHA-256 PCRs (0 to 23) and defaults to
-`none`. A bound credential only unseals while those PCRs hold the values they had
+`--pcrs` takes a comma-separated list of SHA-256 PCRs (0 to 23), or `none`.
+Without it, enrollment keeps the existing record's binding, or binds nothing for
+a new record. A bound credential only unseals while those PCRs hold the values they had
 at enrollment. After a change, the login screen asks for your password instead
 of finishing the face login, until you run `gaze keyring` again. Enrollment warns about PCRs that
-change on routine updates, that any program can reset, or that nothing measured
-this boot. `sudo gaze doctor` shows each record's binding.
+change on routine updates, and about binding while Secure Boot is off. It refuses
+a binding whose PCRs any program can reset or nothing measured this boot, and
+needs the TPM's SHA-256 PCR bank. `sudo gaze doctor` shows each record's binding.
 
 For KDE, use `--kwallet` with `storage.unlock_kwallet = true` and the
 [managed KDE login PAM hooks](/guide/kde#optional-tpm-backed-kwallet-unlock).
