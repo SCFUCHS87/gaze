@@ -282,6 +282,9 @@ instead of the PAM helper below; the module manages the hooks declaratively.
    gaze doctor
    ```
 
+Add `--pcrs 7` to also bind the credential to the Secure Boot state; see the
+[CLI reference](/guide/cli) for what binding does and its limits.
+
 The credential is separate from GNOME Keyring enrollment, so the two wallets can
 have different passwords. It lives encrypted under `/var/lib/gaze/kwallet` and
 is never sent over DBus. After face authentication and liveness succeed, the PAM
@@ -295,7 +298,8 @@ The helper preserves the distribution's password fallback and session setup.
 Users without an enrolled credential still log in by face and unlock the wallet
 inside their session, without an extra greeter password prompt.
 
-Re-enroll after changing your account or wallet password or resetting the TPM.
+Re-enroll after changing your account or wallet password, resetting the TPM, or,
+for a bound credential, after the bound PCRs change.
 An unreadable or invalid stored record requests password fallback. Gaze cannot
 validate a wallet password during enrollment or detect a wallet-only password
 change: an incorrect or stale password leaves the wallet locked. If you typed a
