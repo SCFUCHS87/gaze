@@ -73,9 +73,12 @@ fn prompt_pcrs(
     theme: &ColorfulTheme,
     backend: gaze_security::keyring::Backend,
 ) -> anyhow::Result<gaze_security::keyring::Pcrs> {
-    let value = Input::<String>::with_theme(theme)
-        .with_prompt("Bind to TPM PCRs (e.g. 7 or 7,14; none for no binding)")
-        .default(keyring::existing_pcrs(backend, &get_current_user()).to_string())
+    let mut input = Input::<String>::with_theme(theme)
+        .with_prompt("Bind to TPM PCRs (e.g. 7 or 7,14; none for no binding)");
+    if let Some(pcrs) = keyring::existing_pcrs(backend, &get_current_user()) {
+        input = input.default(pcrs.to_string());
+    }
+    let value = input
         .validate_with(|input: &String| {
             input
                 .parse::<gaze_security::keyring::Pcrs>()

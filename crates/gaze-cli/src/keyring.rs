@@ -89,6 +89,15 @@ fn pcr_warnings(pcrs: Pcrs, sysfs: &Path, efivar: &Path) -> Vec<String> {
             _ => {}
         }
     }
+    // Firmware measures PCRs 0-7 before any OS runs; the rest start fresh in an OS the
+    // attacker boots, which can extend them with this machine's event log until they match.
+    if !pcrs.is_empty() && !pcrs.iter().any(|pcr| pcr <= 7) {
+        warnings.push(format!(
+            "no PCR in {pcrs} is measured by firmware (PCRs 0 to 7), so an OS booted with Secure \
+             Boot off can replay this machine's boot log into them and unseal the credential; \
+             add PCR 7 to the binding"
+        ));
+    }
     if pcrs.iter().any(|pcr| pcr == 7) {
         warnings.push(
             "PCR 7 changes when Secure Boot is toggled or its key databases (db, dbx) are \
@@ -118,12 +127,14 @@ fn chosen_pcrs(
     }
 }
 
-/// The current record's binding, used as the wizard's default.
-pub fn existing_pcrs(backend: Backend, username: &str) -> Pcrs {
-    gaze_security::keyring::record_pcrs(backend, username)
-        .ok()
-        .flatten()
-        .unwrap_or(Pcrs::NONE)
+/// The current record's binding, used as the wizard's default. `None` when the
+/// binding can't be read, so the wizard offers no default to drop it with.
+pub fn existing_pcrs(backend: Backend, username: &str) -> Option<Pcrs> {
+    wizard_default(gaze_security::keyring::record_pcrs(backend, username))
+}
+
+fn wizard_default(existing: anyhow::Result<Option<Pcrs>>) -> Option<Pcrs> {
+    existing.ok().map(|pcrs| pcrs.unwrap_or(Pcrs::NONE))
 }
 
 pub fn enroll(
@@ -237,11 +248,16 @@ mod tests {
         let warn = |list: &str| pcr_warnings(list.parse().unwrap(), &sysfs, &on);
 
         assert!(warn("none").is_empty());
-        assert!(
-            warn("14").is_empty(),
-            "a measured, stable PCR needs no warning"
+        assert_eq!(
+            warn("7,14").len(),
+            1,
+            "a measured, stable PCR needs no warning beyond PCR 7's"
         );
-        assert!(warn("15").is_empty(), "an unreadable PCR is not guessed at");
+        assert_eq!(warn("7,15").len(), 1, "an unreadable PCR is not guessed at");
+        let replayable = warn("14");
+        assert_eq!(replayable.len(), 1);
+        assert!(replayable[0].contains("replay"), "no firmware PCR");
+        assert!(warn("8,9,14").iter().any(|w| w.contains("replay")));
         assert!(warn("12")[0].contains("reset value"), "all zeros");
         assert!(warn("17")[0].contains("reset value"), "all ones");
         for volatile in ["1", "4", "5", "11"] {
@@ -261,7 +277,7 @@ mod tests {
         let sysfs = fake_sysfs("secure-boot");
         for efivar in ["secure-boot-off", "missing"] {
             let warnings = pcr_warnings("14".parse().unwrap(), &sysfs, &sysfs.join(efivar));
-            assert_eq!(warnings.len(), 1, "{efivar}: {warnings:?}");
+            assert_eq!(warnings.len(), 2, "{efivar}: {warnings:?}");
             assert!(
                 warnings[0].contains("Secure Boot is not enabled"),
                 "{efivar}"
@@ -303,6 +319,14 @@ mod tests {
             chosen_pcrs(Some(seven), || panic!("not read when --pcrs is given")).unwrap(),
             seven
         );
+    }
+
+    #[test]
+    fn wizard_offers_no_default_for_an_unreadable_binding() {
+        let seven: Pcrs = "7".parse().unwrap();
+        assert_eq!(wizard_default(Ok(Some(seven))), Some(seven));
+        assert_eq!(wizard_default(Ok(None)), Some(Pcrs::NONE));
+        assert_eq!(wizard_default(Err(anyhow::anyhow!("corrupt"))), None);
     }
 
     #[test]
