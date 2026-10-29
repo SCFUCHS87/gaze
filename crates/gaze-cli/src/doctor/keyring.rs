@@ -233,19 +233,28 @@ pub(super) fn success_skip(control: &str) -> Option<usize> {
     }
 }
 
+/// `None` when unchecked, `Some(None)` when nothing is enrolled, else the record's PCR binding.
 pub(super) fn keyring_record_state(
     username: &str,
     backend: gaze_security::keyring::Backend,
-) -> Option<bool> {
+) -> Option<Option<String>> {
     if !running_as_root() {
         return None;
     }
     let uid = user_uid(username)?;
-    Some(
-        Path::new(backend.store_dir())
-            .join(format!("{uid}.keyring"))
-            .exists(),
-    )
+    if !Path::new(backend.store_dir())
+        .join(format!("{uid}.keyring"))
+        .exists()
+    {
+        return Some(None);
+    }
+    Some(Some(
+        match gaze_security::keyring::record_pcrs(backend, username) {
+            Ok(Some(pcrs)) if !pcrs.is_empty() => format!("bound to PCRs {pcrs}"),
+            Ok(_) => "no PCR binding".to_string(),
+            Err(err) => format!("PCR binding unreadable: {err}"),
+        },
+    ))
 }
 
 pub(super) fn check_keyring(report: &mut Report, username: &str, config: Option<&Config>) {
@@ -394,13 +403,17 @@ pub(super) fn report_greeter_keyring_policy(report: &mut Report, policy: ModuleS
     }
 }
 
-pub(super) fn report_keyring_record(report: &mut Report, username: &str, state: Option<bool>) {
+pub(super) fn report_keyring_record(
+    report: &mut Report,
+    username: &str,
+    state: Option<Option<String>>,
+) {
     match state {
-        Some(true) => report.pass(
+        Some(Some(binding)) => report.pass(
             "Keyring",
-            format!("a TPM-protected keyring credential is enrolled for {username}"),
+            format!("a TPM-protected keyring credential is enrolled for {username} ({binding})"),
         ),
-        Some(false) => report.warning(
+        Some(None) => report.warning(
             "Keyring",
             format!("GNOME Keyring unlock is enabled but {username} has no enrolled credential"),
             format!("Run `sudo gaze keyring --user {username}`."),
@@ -504,11 +517,11 @@ pub(super) fn check_kwallet(report: &mut Report, username: &str, config: Option<
         return;
     }
     match keyring_record_state(username, gaze_security::keyring::Backend::KWallet) {
-        Some(true) => report.pass(
+        Some(Some(binding)) => report.pass(
             "KWallet",
-            format!("a TPM-protected KWallet credential is enrolled for {username}"),
+            format!("a TPM-protected KWallet credential is enrolled for {username} ({binding})"),
         ),
-        Some(false) => report.warning(
+        Some(None) => report.warning(
             "KWallet",
             format!("{username} has no enrolled KWallet credential"),
             format!("Run `sudo gaze keyring --kwallet --user {username}`."),
@@ -576,10 +589,14 @@ mod tests {
             (check.level, check.message, check.fix.unwrap_or_default())
         };
 
-        let (level, _, _) = reported(Some(true));
+        let (level, message, _) = reported(Some(Some("bound to PCRs 7".to_string())));
         assert_eq!(level, Level::Pass);
+        assert!(
+            message.contains("bound to PCRs 7"),
+            "show the binding: {message}"
+        );
 
-        let (level, _, _) = reported(Some(false));
+        let (level, _, _) = reported(Some(None));
         assert_eq!(level, Level::Warning);
 
         let (level, message, fix) = reported(None);

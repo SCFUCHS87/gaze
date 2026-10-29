@@ -210,7 +210,15 @@ gaze keyring --forget           # remove the stored GNOME credential
 gaze keyring --kwallet          # enroll or replace the KDE wallet credential
 gaze keyring --kwallet --forget # remove only the KDE wallet credential
 sudo gaze keyring --user alice  # act on another account
+gaze keyring --pcrs 7           # also bind the credential to the Secure Boot state
 ```
+
+`--pcrs` takes a comma-separated list of SHA-256 PCRs (0 to 23) and defaults to
+`none`. A bound credential only unseals while those PCRs hold the values they had
+at enrollment. After a change, the login screen asks for your password instead
+of finishing the face login, until you run `gaze keyring` again. Enrollment warns about PCRs that
+change on routine updates, that any program can reset, or that nothing measured
+this boot. `sudo gaze doctor` shows each record's binding.
 
 For KDE, use `--kwallet` with `storage.unlock_kwallet = true` and the
 [managed KDE login PAM hooks](/guide/kde#optional-tpm-backed-kwallet-unlock).

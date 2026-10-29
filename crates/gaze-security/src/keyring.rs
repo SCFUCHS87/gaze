@@ -4,6 +4,7 @@
 //! Root-only: no IPC or biometric verdicts live here, and the PAM caller must finish
 //! authentication before calling `load`.
 
+pub use crate::tpm::Pcrs;
 use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
 use anyhow::{Context, ensure};
@@ -52,6 +53,8 @@ impl Backend {
 }
 
 const MAGIC: &[u8; 4] = b"GZK1";
+/// Same layout plus the PCR selection the key was sealed under, right after the magic.
+const MAGIC_PCRS: &[u8; 4] = b"GZK2";
 const MAX_BLOB: usize = 16384;
 pub const MAX_PASSWORD: usize = 4096;
 /// NUL-terminated password, wiped on drop so PAM can copy it without an unwiped CString.
@@ -145,12 +148,23 @@ pub fn validate_password(password: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+// The PCR selection is authenticated too, so a record cannot be edited to claim another policy.
+fn aad(account: &Account, pcrs: Pcrs) -> Vec<u8> {
+    let mut aad = account.binding.to_vec();
+    if !pcrs.is_empty() {
+        aad.extend_from_slice(b"gaze-keyring-pcrs-v1\0");
+        aad.extend_from_slice(&pcrs.bits().to_le_bytes());
+    }
+    aad
+}
+
 fn encrypt(
     key: &[u8; 32],
     account: &Account,
     password: &[u8],
     public: &[u8],
     private: &[u8],
+    pcrs: Pcrs,
 ) -> anyhow::Result<Vec<u8>> {
     validate_password(password)?;
     ensure!(
@@ -166,13 +180,19 @@ fn encrypt(
     let tag = cipher
         .encrypt_inout_detached(
             &Nonce::from(nonce),
-            &account.binding,
+            &aad(account, pcrs),
             secret.as_mut_slice().into(),
         )
         .map_err(|_| anyhow::anyhow!("credential encryption failed"))?;
     // GZK1 | public/private lengths (u32 LE) | sealed blobs | nonce | ciphertext | tag.
+    // GZK2 inserts the PCR mask (u32 LE) after the magic; no PCRs keeps writing GZK1.
     let mut blob = Vec::new();
-    blob.extend_from_slice(MAGIC);
+    if pcrs.is_empty() {
+        blob.extend_from_slice(MAGIC);
+    } else {
+        blob.extend_from_slice(MAGIC_PCRS);
+        blob.extend_from_slice(&pcrs.bits().to_le_bytes());
+    }
     blob.extend_from_slice(&(public.len() as u32).to_le_bytes());
     blob.extend_from_slice(&(private.len() as u32).to_le_bytes());
     blob.extend_from_slice(public);
@@ -183,27 +203,44 @@ fn encrypt(
     Ok(blob)
 }
 
+/// Header length and PCR selection of a record, without touching the TPM.
+fn record_header(blob: &[u8]) -> anyhow::Result<(usize, Pcrs)> {
+    ensure!(blob.len() <= MAX_BLOB, "invalid credential record");
+    match blob.get(..4) {
+        Some(magic) if magic == MAGIC => Ok((4, Pcrs::NONE)),
+        Some(magic) if magic == MAGIC_PCRS && blob.len() >= 8 => {
+            let pcrs = Pcrs::from_bits(u32::from_le_bytes(blob[4..8].try_into()?))?;
+            ensure!(!pcrs.is_empty(), "invalid credential PCR selection");
+            Ok((8, pcrs))
+        }
+        _ => anyhow::bail!("invalid credential record"),
+    }
+}
+
 fn decrypt_with<F>(blob: &[u8], account: &Account, unseal: F) -> anyhow::Result<Secret>
 where
-    F: FnOnce(&[u8], &[u8]) -> anyhow::Result<crate::tpm::SealedKey>,
+    F: FnOnce(&[u8], &[u8], Pcrs) -> anyhow::Result<crate::tpm::SealedKey>,
 {
-    ensure!(
-        blob.len() >= 12 && blob.len() <= MAX_BLOB && &blob[..4] == MAGIC,
-        "invalid credential record"
-    );
-    let public_len = u32::from_le_bytes(blob[4..8].try_into()?) as usize;
-    let private_len = u32::from_le_bytes(blob[8..12].try_into()?) as usize;
+    let (header, pcrs) = record_header(blob)?;
+    ensure!(blob.len() >= header + 8, "invalid credential record");
+    let public_len = u32::from_le_bytes(blob[header..header + 4].try_into()?) as usize;
+    let private_len = u32::from_le_bytes(blob[header + 4..header + 8].try_into()?) as usize;
     ensure!(
         public_len <= 4096 && private_len <= 4096,
         "invalid sealed key length"
     );
-    let end = 12 + public_len + private_len;
+    let start = header + 8;
+    let end = start + public_len + private_len;
     let ciphertext_len = blob.len().checked_sub(end + 12 + 16);
     ensure!(
         ciphertext_len.is_some_and(|len| (2..=MAX_PASSWORD + 1).contains(&len)),
         "invalid credential ciphertext length"
     );
-    let key = unseal(&blob[12..12 + public_len], &blob[12 + public_len..end])?;
+    let key = unseal(
+        &blob[start..start + public_len],
+        &blob[start + public_len..end],
+        pcrs,
+    )?;
     let cipher =
         Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| anyhow::anyhow!("invalid key"))?;
     let nonce =
@@ -215,7 +252,7 @@ where
     cipher
         .decrypt_inout_detached(
             &nonce,
-            &account.binding,
+            &aad(account, pcrs),
             password.as_mut_slice().into(),
             &tag,
         )
@@ -309,10 +346,15 @@ fn remove_record(dir: &Path, uid: u32) -> anyhow::Result<()> {
 }
 
 pub fn enroll(username: &str, password: &[u8]) -> anyhow::Result<()> {
-    enroll_for(Backend::Gnome, username, password)
+    enroll_for(Backend::Gnome, username, password, Pcrs::NONE)
 }
 
-pub fn enroll_for(backend: Backend, username: &str, password: &[u8]) -> anyhow::Result<()> {
+pub fn enroll_for(
+    backend: Backend,
+    username: &str,
+    password: &[u8],
+    pcrs: Pcrs,
+) -> anyhow::Result<()> {
     let account = backend.account(username)?;
     validate_password(password)?;
     let dir = Path::new(backend.store_dir());
@@ -326,8 +368,8 @@ pub fn enroll_for(backend: Backend, username: &str, password: &[u8]) -> anyhow::
     check_directory(dir, 0)?;
     let mut key = Zeroizing::new([0; 32]);
     getrandom::fill(key.as_mut()).map_err(|_| anyhow::anyhow!("random key unavailable"))?;
-    let (public, private) = crate::tpm::seal(&key)?;
-    let blob = encrypt(&key, &account, password, &public, &private)?;
+    let (public, private) = crate::tpm::seal(&key, pcrs)?;
+    let blob = encrypt(&key, &account, password, &public, &private, pcrs)?;
     // Verify sealing before replacing a working record; a failed setup leaves it intact.
     let _check = decrypt_with(&blob, &account, crate::tpm::unseal)?;
     ensure!(
@@ -350,6 +392,20 @@ pub fn forget_for(backend: Backend, username: &str) -> anyhow::Result<()> {
     }
     check_directory(dir, 0)?;
     remove_record(dir, uid)
+}
+
+/// PCR selection of an enrolled record, read from its header without unsealing it.
+pub fn record_pcrs(backend: Backend, username: &str) -> anyhow::Result<Option<Pcrs>> {
+    let uid = Account::uid(username)?;
+    let dir = Path::new(backend.store_dir());
+    if !dir.try_exists()? {
+        return Ok(None);
+    }
+    check_directory(dir, 0)?;
+    let Some(blob) = read_record(&record_path(dir, uid), 0)? else {
+        return Ok(None);
+    };
+    Ok(Some(record_header(&blob)?.1))
 }
 
 /// Call only from trusted PAM code after face, liveness, and confirmation succeed.
@@ -391,21 +447,97 @@ mod tests {
         Account::bound_to(1000, "alice", b"shadow-hash")
     }
     fn blob() -> Vec<u8> {
-        encrypt(&KEY, &account(), b"test password", b"public", b"private").unwrap()
+        encrypt(
+            &KEY,
+            &account(),
+            b"test password",
+            b"public",
+            b"private",
+            Pcrs::NONE,
+        )
+        .unwrap()
     }
 
     #[test]
     fn authenticated_record_round_trips_without_plaintext_on_disk() {
         let blob = blob();
         assert!(!blob.windows(13).any(|w| w == b"test password"));
-        let secret = decrypt_with(&blob, &account(), |public, private| {
+        let secret = decrypt_with(&blob, &account(), |public, private, pcrs| {
             assert_eq!(public, b"public");
             assert_eq!(private, b"private");
+            assert_eq!(pcrs, Pcrs::NONE);
             Ok(Zeroizing::new(KEY))
         })
         .unwrap();
         assert_eq!(secret.as_slice(), b"test password\0");
         assert_ne!(blob, self::blob(), "fresh nonce on every enrollment");
+    }
+
+    #[test]
+    fn records_without_pcrs_keep_the_original_format() {
+        assert_eq!(&blob()[..4], MAGIC);
+        assert_eq!(record_header(&blob()).unwrap(), (4, Pcrs::NONE));
+    }
+
+    #[test]
+    fn pcr_bound_records_carry_and_authenticate_their_selection() {
+        let pcrs: Pcrs = "7,14".parse().unwrap();
+        let blob = encrypt(
+            &KEY,
+            &account(),
+            b"test password",
+            b"public",
+            b"private",
+            pcrs,
+        )
+        .unwrap();
+        assert_eq!(&blob[..4], MAGIC_PCRS);
+        assert_eq!(record_header(&blob).unwrap(), (8, pcrs));
+        let secret = decrypt_with(&blob, &account(), |public, private, seen| {
+            assert_eq!(public, b"public");
+            assert_eq!(private, b"private");
+            assert_eq!(seen, pcrs, "unseal must replay the enrolled policy");
+            Ok(Zeroizing::new(KEY))
+        })
+        .unwrap();
+        assert_eq!(secret.as_slice(), b"test password\0");
+
+        // Claiming a different selection, or none at all, fails authentication.
+        let mut edited = blob.clone();
+        edited[4..8].copy_from_slice(&(1u32 << 7).to_le_bytes());
+        assert!(decrypt_with(&edited, &account(), |_, _, _| Ok(Zeroizing::new(KEY))).is_err());
+        let mut stripped = MAGIC.to_vec();
+        stripped.extend_from_slice(&blob[8..]);
+        assert!(decrypt_with(&stripped, &account(), |_, _, _| Ok(Zeroizing::new(KEY))).is_err());
+    }
+
+    #[test]
+    fn malformed_pcr_headers_are_rejected_before_touching_tpm() {
+        let pcrs: Pcrs = "7".parse().unwrap();
+        let good = encrypt(
+            &KEY,
+            &account(),
+            b"test password",
+            b"public",
+            b"private",
+            pcrs,
+        )
+        .unwrap();
+        let mut empty = good.clone();
+        empty[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let mut too_high = good.clone();
+        too_high[4..8].copy_from_slice(&(1u32 << 24).to_le_bytes());
+        for invalid in [empty, too_high, good[..6].to_vec()] {
+            let touched = Cell::new(false);
+            assert!(
+                decrypt_with(&invalid, &account(), |_, _, _| {
+                    touched.set(true);
+                    Ok(Zeroizing::new(KEY))
+                })
+                .is_err()
+            );
+            assert!(!touched.get());
+        }
     }
 
     #[test]
@@ -415,10 +547,18 @@ mod tests {
         assert_eq!(gnome.binding, account().binding);
         assert_ne!(gnome.binding, kde.binding);
         assert_ne!(Backend::Gnome.store_dir(), Backend::KWallet.store_dir());
-        let blob = encrypt(&KEY, &kde, b"wallet password", b"public", b"private").unwrap();
-        assert!(decrypt_with(&blob, &gnome, |_, _| Ok(Zeroizing::new(KEY))).is_err());
+        let blob = encrypt(
+            &KEY,
+            &kde,
+            b"wallet password",
+            b"public",
+            b"private",
+            Pcrs::NONE,
+        )
+        .unwrap();
+        assert!(decrypt_with(&blob, &gnome, |_, _, _| Ok(Zeroizing::new(KEY))).is_err());
         assert_eq!(
-            decrypt_with(&blob, &kde, |_, _| Ok(Zeroizing::new(KEY)))
+            decrypt_with(&blob, &kde, |_, _, _| Ok(Zeroizing::new(KEY)))
                 .unwrap()
                 .as_slice(),
             b"wallet password\0"
@@ -432,22 +572,22 @@ mod tests {
             Account::bound_to(1001, "alice", b"shadow-hash"),
             Account::bound_to(1000, "bob", b"shadow-hash"),
         ] {
-            assert!(decrypt_with(&blob(), &changed, |_, _| Ok(Zeroizing::new(KEY))).is_err());
+            assert!(decrypt_with(&blob(), &changed, |_, _, _| Ok(Zeroizing::new(KEY))).is_err());
         }
     }
 
     #[test]
     fn missing_reset_or_wrong_tpm_and_tampering_fail_closed() {
         assert!(
-            decrypt_with(&blob(), &account(), |_, _| anyhow::bail!(
+            decrypt_with(&blob(), &account(), |_, _, _| anyhow::bail!(
                 "TPM missing/reset"
             ))
             .is_err()
         );
-        assert!(decrypt_with(&blob(), &account(), |_, _| Ok(Zeroizing::new([9; 32]))).is_err());
+        assert!(decrypt_with(&blob(), &account(), |_, _, _| Ok(Zeroizing::new([9; 32]))).is_err());
         let mut corrupt = blob();
         *corrupt.last_mut().unwrap() ^= 1;
-        assert!(decrypt_with(&corrupt, &account(), |_, _| Ok(Zeroizing::new(KEY))).is_err());
+        assert!(decrypt_with(&corrupt, &account(), |_, _, _| Ok(Zeroizing::new(KEY))).is_err());
     }
 
     #[test]
@@ -469,7 +609,7 @@ mod tests {
         ] {
             let touched = Cell::new(false);
             assert!(
-                decrypt_with(&invalid, &account(), |_, _| {
+                decrypt_with(&invalid, &account(), |_, _, _| {
                     touched.set(true);
                     Ok(Zeroizing::new(KEY))
                 })
@@ -480,7 +620,7 @@ mod tests {
         let blob = blob();
         for end in 0..blob.len() {
             assert!(
-                decrypt_with(&blob[..end], &account(), |_, _| Ok(Zeroizing::new(KEY))).is_err()
+                decrypt_with(&blob[..end], &account(), |_, _, _| Ok(Zeroizing::new(KEY))).is_err()
             );
         }
     }
@@ -492,12 +632,12 @@ mod tests {
             b"embedded\0nul".to_vec(),
             vec![b'x'; MAX_PASSWORD + 1],
         ] {
-            assert!(encrypt(&KEY, &account(), &password, b"p", b"s").is_err());
+            assert!(encrypt(&KEY, &account(), &password, b"p", b"s", Pcrs::NONE).is_err());
         }
         let password = vec![b'x'; MAX_PASSWORD];
-        let blob = encrypt(&KEY, &account(), &password, b"p", b"s").unwrap();
+        let blob = encrypt(&KEY, &account(), &password, b"p", b"s", Pcrs::NONE).unwrap();
         assert_eq!(
-            decrypt_with(&blob, &account(), |_, _| Ok(Zeroizing::new(KEY)))
+            decrypt_with(&blob, &account(), |_, _, _| Ok(Zeroizing::new(KEY)))
                 .unwrap()
                 .len(),
             MAX_PASSWORD + 1

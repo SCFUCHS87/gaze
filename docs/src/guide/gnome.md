@@ -172,11 +172,15 @@ password leaves the keyring locked and requires a manual unlock and re-enrollmen
 
 Before enabling keyring unlock, review these security implications.
 
-- **The record is recoverable by root on this machine.** Sealing has no PCR
-  policy, so anyone who can run code as root here, including someone who boots
-  another OS from a USB stick against an unencrypted disk, can unseal the key
-  and recover the plaintext password. It protects a *stolen disk*, not a machine
-  someone else can boot. Enable full-disk encryption if that matters to you.
+- **The record is recoverable by root on this machine.** By default sealing has
+  no PCR policy, so anyone who can run code as root here, including someone who
+  boots another OS from a USB stick against an unencrypted disk, can unseal the
+  key and recover the plaintext password. It protects a *stolen disk*, not a
+  machine someone else can boot. Enable full-disk encryption if that matters to
+  you. `gaze keyring --pcrs 7` binds the record to the Secure Boot state, which
+  stops a boot with Secure Boot off or with another vendor's signed boot chain.
+  It does not stop root on the running system, or a live USB signed by the same
+  distribution, so it does not replace full-disk encryption.
 - **The password becomes visible to the rest of the `gdm-face` stack.** Once
   `PAM_AUTHTOK` is set, every later module in that service can read it, including
   the distribution-managed `postlogin`, `system-auth` and `common-session`

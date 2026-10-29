@@ -69,6 +69,20 @@ fn prompt_security_threshold(
     Ok(value)
 }
 
+fn prompt_pcrs(theme: &ColorfulTheme) -> anyhow::Result<gaze_security::keyring::Pcrs> {
+    let value = Input::<String>::with_theme(theme)
+        .with_prompt("Bind to TPM PCRs (e.g. 7 or 7,14; none for no binding)")
+        .default("none".to_string())
+        .validate_with(|input: &String| {
+            input
+                .parse::<gaze_security::keyring::Pcrs>()
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+        })
+        .interact_text()?;
+    value.parse()
+}
+
 pub async fn run_config_wizard(
     term: &Term,
     proxy: &GazeProxy<'_>,
@@ -391,6 +405,7 @@ pub async fn run_config_wizard(
             &get_current_user(),
             &config,
             gaze_security::keyring::Backend::Gnome,
+            prompt_pcrs(&theme)?,
         )?;
     }
 
@@ -404,6 +419,7 @@ pub async fn run_config_wizard(
             &get_current_user(),
             &config,
             gaze_security::keyring::Backend::KWallet,
+            prompt_pcrs(&theme)?,
         )?;
     }
 

@@ -320,6 +320,9 @@ enum Commands {
         forget: bool,
         #[arg(short, long, help = "Act on this user instead of the current one")]
         user: Option<String>,
+        /// Bind the credential to these SHA-256 PCRs, e.g. `7` or `7,14` (default: none)
+        #[arg(long, default_value = "none", conflicts_with = "forget")]
+        pcrs: gaze_security::keyring::Pcrs,
     },
     /// Check the Gaze installation for configuration and runtime issues
     Doctor {
@@ -786,6 +789,7 @@ async fn run() -> anyhow::Result<()> {
             forget,
             user,
             kwallet,
+            pcrs,
         } => {
             let backend = if *kwallet {
                 gaze_security::keyring::Backend::KWallet
@@ -800,7 +804,7 @@ async fn run() -> anyhow::Result<()> {
                     backend.name()
                 );
             } else {
-                keyring::enroll(&username, &Config::load()?, backend)?;
+                keyring::enroll(&username, &Config::load()?, backend, *pcrs)?;
             }
             return Ok(());
         }
@@ -1003,6 +1007,25 @@ mod tests {
                 "{args:?} must require root"
             );
         }
+    }
+
+    #[test]
+    fn keyring_pcrs_parse_default_to_none_and_reject_bad_input() {
+        let pcrs = |args: &[&str]| match Cli::try_parse_from(args).map(|cli| cli.command) {
+            Ok(Commands::Keyring { pcrs, .. }) => Ok(pcrs),
+            Ok(_) => panic!("not the keyring command"),
+            Err(err) => Err(err),
+        };
+        assert!(pcrs(&["gaze", "keyring"]).unwrap().is_empty());
+        assert_eq!(
+            pcrs(&["gaze", "keyring", "--pcrs", "7,14"])
+                .unwrap()
+                .to_string(),
+            "7,14"
+        );
+        assert!(pcrs(&["gaze", "keyring", "--pcrs", "24"]).is_err());
+        assert!(pcrs(&["gaze", "keyring", "--pcrs", "seven"]).is_err());
+        assert!(pcrs(&["gaze", "keyring", "--forget", "--pcrs", "7"]).is_err());
     }
 
     #[test]
