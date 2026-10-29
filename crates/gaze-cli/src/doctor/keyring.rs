@@ -259,7 +259,7 @@ pub(super) fn keyring_record_state(
     {
         return RecordState::Missing;
     }
-    match gaze_security::keyring::record_pcrs(backend, username) {
+    match gaze_security::keyring::record_pcrs_current(backend, username) {
         Ok(Some(pcrs)) if !pcrs.is_empty() => {
             RecordState::Enrolled(format!("bound to PCRs {pcrs}"))
         }

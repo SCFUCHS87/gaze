@@ -374,6 +374,21 @@ pub fn seal(key: &[u8; KEY_LEN], pcrs: Pcrs) -> anyhow::Result<(Vec<u8>, Vec<u8>
     Ok((public.marshall()?, private.value().to_vec()))
 }
 
+/// Whether `pcrs` still hold the values `public` was sealed against. A trial session
+/// recomputes the policy digest from the current PCRs, so nothing is unsealed.
+pub fn pcr_policy_holds_in(
+    context: &mut Context,
+    public: &Public,
+    pcrs: Pcrs,
+) -> anyhow::Result<bool> {
+    Ok(pcr_policy_digest(context, pcrs)? == *public.auth_policy())
+}
+
+pub fn pcr_policy_holds(public: &[u8], pcrs: Pcrs) -> anyhow::Result<bool> {
+    let mut context = local_device_context()?;
+    pcr_policy_holds_in(&mut context, &Public::unmarshall(public)?, pcrs)
+}
+
 pub fn unseal(public: &[u8], private: &[u8], pcrs: Pcrs) -> anyhow::Result<SealedKey> {
     let mut context = local_device_context()?;
     unseal_bound_in(
@@ -509,7 +524,13 @@ mod tests {
             "the empty auth value must not bypass the policy"
         );
 
+        assert!(pcr_policy_holds_in(&mut context, &public, pcrs).unwrap());
+
         extend_pcr16(&mut context);
+        assert!(
+            !pcr_policy_holds_in(&mut context, &public, pcrs).unwrap(),
+            "a changed PCR is seen without unsealing"
+        );
         let error = unseal_bound_in(&mut context, public, private, pcrs).unwrap_err();
         assert!(error.downcast_ref::<PolicyFailed>().is_some(), "{error:#}");
     }

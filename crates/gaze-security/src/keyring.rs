@@ -217,11 +217,8 @@ fn record_header(blob: &[u8]) -> anyhow::Result<(usize, Pcrs)> {
     }
 }
 
-fn decrypt_with<F>(blob: &[u8], account: &Account, unseal: F) -> anyhow::Result<Secret>
-where
-    F: FnOnce(&[u8], &[u8], Pcrs) -> anyhow::Result<crate::tpm::SealedKey>,
-{
-    let (header, pcrs) = record_header(blob)?;
+/// The sealed public and private blobs after the header, and where they end.
+fn sealed_blobs(blob: &[u8], header: usize) -> anyhow::Result<(&[u8], &[u8], usize)> {
     ensure!(blob.len() >= header + 8, "invalid credential record");
     let public_len = u32::from_le_bytes(blob[header..header + 4].try_into()?) as usize;
     let private_len = u32::from_le_bytes(blob[header + 4..header + 8].try_into()?) as usize;
@@ -231,16 +228,42 @@ where
     );
     let start = header + 8;
     let end = start + public_len + private_len;
+    ensure!(blob.len() >= end, "invalid credential record");
+    Ok((
+        &blob[start..start + public_len],
+        &blob[start + public_len..end],
+        end,
+    ))
+}
+
+/// The record's binding, failing as an unseal would when its PCRs no longer hold.
+fn current_pcrs_with<F>(blob: &[u8], holds: F) -> anyhow::Result<Pcrs>
+where
+    F: FnOnce(&[u8], Pcrs) -> anyhow::Result<bool>,
+{
+    let (header, pcrs) = record_header(blob)?;
+    if pcrs.is_empty() {
+        return Ok(pcrs);
+    }
+    let (public, _, _) = sealed_blobs(blob, header)?;
+    if !holds(public, pcrs)? {
+        return Err(crate::tpm::PolicyFailed(pcrs).into());
+    }
+    Ok(pcrs)
+}
+
+fn decrypt_with<F>(blob: &[u8], account: &Account, unseal: F) -> anyhow::Result<Secret>
+where
+    F: FnOnce(&[u8], &[u8], Pcrs) -> anyhow::Result<crate::tpm::SealedKey>,
+{
+    let (header, pcrs) = record_header(blob)?;
+    let (public, private, end) = sealed_blobs(blob, header)?;
     let ciphertext_len = blob.len().checked_sub(end + 12 + 16);
     ensure!(
         ciphertext_len.is_some_and(|len| (2..=MAX_PASSWORD + 1).contains(&len)),
         "invalid credential ciphertext length"
     );
-    let key = unseal(
-        &blob[start..start + public_len],
-        &blob[start + public_len..end],
-        pcrs,
-    )?;
+    let key = unseal(public, private, pcrs)?;
     let cipher =
         Aes256Gcm::new_from_slice(key.as_ref()).map_err(|_| anyhow::anyhow!("invalid key"))?;
     let nonce =
@@ -394,18 +417,29 @@ pub fn forget_for(backend: Backend, username: &str) -> anyhow::Result<()> {
     remove_record(dir, uid)
 }
 
-/// PCR selection of an enrolled record, read from its header without unsealing it.
-pub fn record_pcrs(backend: Backend, username: &str) -> anyhow::Result<Option<Pcrs>> {
+fn enrolled_record(backend: Backend, username: &str) -> anyhow::Result<Option<Vec<u8>>> {
     let uid = Account::uid(username)?;
     let dir = Path::new(backend.store_dir());
     if !dir.try_exists()? {
         return Ok(None);
     }
     check_directory(dir, 0)?;
-    let Some(blob) = read_record(&record_path(dir, uid), 0)? else {
-        return Ok(None);
-    };
-    Ok(Some(record_header(&blob)?.1))
+    read_record(&record_path(dir, uid), 0)
+}
+
+/// PCR selection of an enrolled record, read from its header without unsealing it.
+pub fn record_pcrs(backend: Backend, username: &str) -> anyhow::Result<Option<Pcrs>> {
+    enrolled_record(backend, username)?
+        .map(|blob| Ok(record_header(&blob)?.1))
+        .transpose()
+}
+
+/// Like [`record_pcrs`], but fails with [`crate::tpm::PolicyFailed`] when the bound PCRs no
+/// longer hold their enrolled values, so PAM would refuse the record. Nothing is unsealed.
+pub fn record_pcrs_current(backend: Backend, username: &str) -> anyhow::Result<Option<Pcrs>> {
+    enrolled_record(backend, username)?
+        .map(|blob| current_pcrs_with(&blob, crate::tpm::pcr_policy_holds))
+        .transpose()
 }
 
 /// Call only from trusted PAM code after face, liveness, and confirmation succeed.
@@ -525,6 +559,29 @@ mod tests {
         let mut stripped = MAGIC.to_vec();
         stripped.extend_from_slice(&blob[8..]);
         assert!(decrypt_with(&stripped, &account(), |_, _, _| Ok(Zeroizing::new(KEY))).is_err());
+    }
+
+    #[test]
+    fn a_stale_binding_is_reported_without_unsealing() {
+        let seven: Pcrs = "7".parse().unwrap();
+        let bound = encrypt(&KEY, &account(), b"pw", b"public", b"private", seven).unwrap();
+        let holds = |result: bool| {
+            move |public: &[u8], pcrs: Pcrs| {
+                assert_eq!((public, pcrs), (&b"public"[..], seven));
+                Ok(result)
+            }
+        };
+        assert_eq!(current_pcrs_with(&bound, holds(true)).unwrap(), seven);
+        let error = current_pcrs_with(&bound, holds(false)).unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::tpm::PolicyFailed>().is_some(),
+            "{error:#}"
+        );
+
+        let unbound = encrypt(&KEY, &account(), b"pw", b"public", b"private", Pcrs::NONE).unwrap();
+        let checked = current_pcrs_with(&unbound, |_, _| panic!("no policy to check"));
+        assert_eq!(checked.unwrap(), Pcrs::NONE);
+        assert!(current_pcrs_with(&bound[..10], |_, _| Ok(true)).is_err());
     }
 
     #[test]

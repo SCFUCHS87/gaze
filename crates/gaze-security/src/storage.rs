@@ -69,10 +69,10 @@ pub fn encryption_warning(status: DiskEncryption) -> Option<&'static str> {
     match status {
         DiskEncryption::Encrypted => None,
         DiskEncryption::Unencrypted => Some(
-            "Gaze state storage appears unencrypted. TPM sealing has no PCR policy: someone who boots another OS on this machine can unseal accessible keys and recover face templates and enrolled keyring/wallet passwords. Enable full-disk encryption for the storage holding /var/lib/gaze; TPM encryption alone does not prevent this attack.",
+            "Gaze state storage appears unencrypted. The template key, and any keyring/wallet password enrolled without --pcrs, are sealed with no PCR policy: someone who boots another OS on this machine can unseal them and recover face templates and those passwords. Enable full-disk encryption for the storage holding /var/lib/gaze; TPM encryption alone does not prevent this attack.",
         ),
         DiskEncryption::Unknown => Some(
-            "Gaze could not verify encryption of its state storage. TPM sealing has no PCR policy: a live-USB/root attacker on this machine can unseal accessible keys, including enrolled keyring/wallet passwords. Verify that the storage holding /var/lib/gaze is protected by full-disk encryption; do not assume the TPM protects against an alternate boot.",
+            "Gaze could not verify encryption of its state storage. Root on this system can unseal accessible keys, including enrolled keyring/wallet passwords, and the template key and any password enrolled without --pcrs have no PCR policy, so a live USB can unseal them too. Verify that the storage holding /var/lib/gaze is protected by full-disk encryption; do not assume the TPM protects against an alternate boot.",
         ),
     }
 }

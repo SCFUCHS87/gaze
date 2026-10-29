@@ -221,7 +221,8 @@ of finishing the face login, until you run `gaze keyring` again. Enrollment warn
 change on routine updates, about a binding with no firmware PCR (0 to 7), which
 another OS can replay, and about binding while Secure Boot is off. It refuses a
 binding made only of PCRs that any program can reset or that nothing measured
-this boot, and needs the TPM's SHA-256 PCR bank. `sudo gaze doctor` shows each record's binding.
+this boot, and needs the TPM's SHA-256 PCR bank. `sudo gaze doctor` shows each record's binding, and warns when its PCRs
+no longer hold the enrolled values, without unsealing the record.
 
 For KDE, use `--kwallet` with `storage.unlock_kwallet = true` and the
 [managed KDE login PAM hooks](/guide/kde#optional-tpm-backed-kwallet-unlock).
